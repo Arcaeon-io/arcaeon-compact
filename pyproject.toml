@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "arcaeon-compact"
+version = "0.1.0"
+description = "Tamper-evident receipts for context compaction. Prove what your summarizer dropped."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Arcaeon" }]
+keywords = ["ai", "agents", "context", "compaction", "summarization", "audit",
+            "tamper-evident", "provenance", "memory"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Intended Audience :: Developers",
+  "Topic :: Software Development :: Libraries",
+]
+dependencies = ["arcaeon-ledger>=0.5.1"]
+
+[project.urls]
+Homepage = "https://arcaeon.io"
+
+[tool.hatch.build.targets.wheel]
+packages = ["arcaeon_compact"]
