@@ -54,12 +54,22 @@ from typing import Any, Iterable, Sequence
 
 from arcaeon_ledger import Ledger, digest_bytes, digest_json
 
-__version__ = "0.1.1"
-__all__ = ["CompactionReceipt", "verify_receipt", "SCHEMA"]
+__version__ = "0.1.2"
+__all__ = ["CompactionReceipt", "verify_receipt", "SCHEMA", "SCHEMA_V1", "SCHEMA_V2"]
 
-# The receipt schema label, frozen at v1. A future shape change mints v2;
-# old rows keep v1 forever, so a schema drift never reads history as tampered.
-SCHEMA = "arcaeon-compact:receipt:v1"
+# The receipt schema label. v1 is frozen forever — old rows keep it and stay
+# verifiable exactly as they always did; a schema drift never reads history
+# as tampered. `seal()` now mints v2 rows (HIGH-1 fix, 2026-08-15): v1 never
+# recorded `introduced.bytes`, so whenever a receipt claimed an introduction
+# (every real summarizer), `post.bytes` was only lower-bounded by
+# self-consistency, not pinned — a forged row could understate `dropped.bytes`
+# behind a claimed introduction and still self-verify with no content held.
+# v2 adds `introduced.bytes` (computed for real from the post-content given
+# to `record_kept()`, not caller-suppliable) so verify can assert exact byte
+# reconciliation unconditionally, not only for pure truncation.
+SCHEMA_V1 = "arcaeon-compact:receipt:v1"
+SCHEMA_V2 = "arcaeon-compact:receipt:v2"
+SCHEMA = SCHEMA_V2  # the schema new receipts are sealed under
 
 
 def _now_iso() -> str:
@@ -179,7 +189,7 @@ class CompactionReceipt:
             raise ValueError(
                 "seal() before record_kept() — record the survivor first "
                 "(an empty list is a valid survivor: everything was dropped)")
-        post_digests, _post_sizes, post_whole, post_bytes = self._post
+        post_digests, post_sizes, post_whole, post_bytes = self._post
 
         # Inferred drop set: pre minus kept, as a multiset over digests, in
         # pre order. Duplicates count: keeping one copy of a twice-seen item
@@ -196,6 +206,19 @@ class CompactionReceipt:
         # Whatever the survivor holds that pre never did was INTRODUCED by the
         # compactor (the summary text itself, typically).
         introduced = sum(remaining.values())
+        # v2 (HIGH-1, 2026-08-15): the BYTE total of what was introduced, not
+        # just the count. Digest determines content determines byte size, so
+        # every occurrence of a given digest has one fixed size -- build a
+        # size-by-digest lookup from the real post content once, then sum it
+        # over the leftover (unmatched) digest multiset. This is computed
+        # from `self._post`, which only exists because `record_kept()` was
+        # called with the actual survivor -- a caller can't hand-wave this
+        # number the way a hand-forged raw row can hand-wave `post.bytes`.
+        size_by_digest: dict[str, int] = {}
+        for d, n in zip(post_digests, post_sizes):
+            size_by_digest.setdefault(d, n)
+        introduced_bytes = sum(cnt * size_by_digest[d]
+                               for d, cnt in remaining.items() if cnt > 0)
 
         if self._dropped_explicit is not None and \
                 Counter(self._dropped_explicit) != Counter(dropped):
@@ -212,7 +235,7 @@ class CompactionReceipt:
                      "digest": post_whole},
             "dropped": {"count": len(dropped), "bytes": dropped_bytes,
                         "items": dropped},
-            "introduced": {"count": introduced},
+            "introduced": {"count": introduced, "bytes": introduced_bytes},
             "compactor": compactor,
             "method": method,
         }
@@ -253,10 +276,24 @@ def verify_receipt(row: dict, pre_content: Sequence[Any] | None = None,
     — a receipt that claims nothing was dropped while something was, fails
     here by construction.
 
+    Schema v1/v2 (HIGH-1, 2026-08-15): v1 rows never recorded
+    `introduced.bytes`, so whenever a receipt claimed an introduction,
+    `post.bytes` was only lower-bounded — a receipt could understate
+    `dropped.bytes` behind a claimed introduction and still self-verify with
+    no content held. v2 records `introduced.bytes` (computed from the real
+    post-content at seal time, not caller-suppliable), letting this function
+    assert exact byte reconciliation unconditionally. Both schemas verify;
+    the result says which rule applied so a caller reading old + new rows in
+    one ledger doesn't have to guess: `out["schema"]` is `"v1"` or `"v2"`,
+    and `out["understatement_check"]` is `"truncation-only"` (v1 — pinned
+    only when nothing was introduced) or `"full"` (v2 — pinned always).
+
     Returns:
         {"ok": bool,                       # self_consistent AND content didn't mismatch
          "self_consistent": bool,
          "content": "skipped" | "match" | "mismatch",
+         "schema": "v1" | "v2",
+         "understatement_check": "truncation-only" | "full",
          "notes": [<str>, ...]}
 
     What a pass MEANS, exactly: the row is internally coherent and, if you
@@ -266,20 +303,30 @@ def verify_receipt(row: dict, pre_content: Sequence[Any] | None = None,
     """
     notes: list[str] = []
     out = {"ok": False, "self_consistent": False, "content": "skipped",
-           "notes": notes}
+           "schema": None, "understatement_check": None, "notes": notes}
 
     # --- self-consistency ---------------------------------------------------
     sc = True
-    if row.get("schema") != SCHEMA:
-        notes.append(f"unknown schema {row.get('schema')!r} — cannot verify")
+    row_schema = row.get("schema")
+    if row_schema == SCHEMA_V1:
+        schema_version, understatement_check = "v1", "truncation-only"
+    elif row_schema == SCHEMA_V2:
+        schema_version, understatement_check = "v2", "full"
+    else:
+        notes.append(f"unknown schema {row_schema!r} — cannot verify")
         return out
+    out["schema"], out["understatement_check"] = schema_version, understatement_check
     try:
         pre, post, dropped = row["pre"], row["post"], row["dropped"]
         introduced = row["introduced"]
-        counts = (pre["count"], post["count"], dropped["count"],
+        counts = [pre["count"], post["count"], dropped["count"],
                   introduced["count"], pre["bytes"], post["bytes"],
-                  dropped["bytes"])
+                  dropped["bytes"]]
         manifest = dropped["items"]
+        introduced_bytes = None
+        if schema_version == "v2":
+            introduced_bytes = introduced["bytes"]  # KeyError -> malformed v2 row
+            counts.append(introduced_bytes)
     except (KeyError, TypeError) as e:
         notes.append(f"malformed receipt row: missing {e}")
         return out
@@ -322,6 +369,23 @@ def verify_receipt(row: dict, pre_content: Sequence[Any] | None = None,
         sc = False
         notes.append(f"dropped.count is 0 but dropped.bytes is "
                      f"{dropped['bytes']}")
+    elif schema_version == "v2":
+        # v2 (HIGH-1 fix): introduced.bytes is recorded, so the equation pins
+        # post.bytes EXACTLY, unconditionally -- not only when nothing was
+        # introduced. This is what closes the gap the v1 branch below still
+        # has: a v1 receipt claiming an introduction could set post.bytes to
+        # anything >= kept_bytes and still self-verify, laundering an
+        # understated dropped.bytes behind the claimed introduction. Still
+        # self-reported data like every other field here -- this pins the
+        # RELATIONSHIP between the four numbers, it does not by itself prove
+        # any one of them true without content (see
+        # test_row_edit_caught_without_content for that general limit).
+        want_post_bytes = pre["bytes"] - dropped["bytes"] + introduced_bytes
+        if post["bytes"] != want_post_bytes:
+            sc = False
+            notes.append(f"bytes do not reconcile: pre.bytes - dropped.bytes + "
+                         f"introduced.bytes = {want_post_bytes}, got post.bytes "
+                         f"{post['bytes']}")
     else:
         kept_bytes = pre["bytes"] - dropped["bytes"]
         if introduced["count"] == 0 and post["bytes"] != kept_bytes:
@@ -332,7 +396,10 @@ def verify_receipt(row: dict, pre_content: Sequence[Any] | None = None,
         elif post["bytes"] < kept_bytes:
             sc = False
             notes.append(f"bytes do not reconcile: post.bytes {post['bytes']} "
-                         f"is below the kept bytes it must contain ({kept_bytes})")
+                         f"is below the kept bytes it must contain ({kept_bytes}) "
+                         f"-- v1 schema: this is only a lower bound, not an "
+                         f"exact pin, whenever introduced.count>0 (the HIGH-1 "
+                         f"gap; re-seal under v2 to close it)")
     if row.get("receipt_digest") != digest_json(_core_body(row)):
         sc = False
         notes.append("receipt_digest does not reproduce from the row's core "
@@ -399,6 +466,17 @@ def verify_receipt(row: dict, pre_content: Sequence[Any] | None = None,
             notes.append(f"introduced.count: recomputed "
                          f"{sum(remaining.values())} != claimed "
                          f"{introduced['count']}")
+        elif schema_version == "v2":
+            post_size_by_digest: dict[str, int] = {}
+            for d, n in zip(post_digests, _sizes):
+                post_size_by_digest.setdefault(d, n)
+            actual_introduced_bytes = sum(
+                cnt * post_size_by_digest[d] for d, cnt in remaining.items() if cnt > 0)
+            if actual_introduced_bytes != introduced_bytes:
+                mismatch = True
+                notes.append(f"introduced.bytes: recomputed "
+                             f"{actual_introduced_bytes} != claimed "
+                             f"{introduced_bytes}")
 
     out["content"] = "mismatch" if mismatch else ("match" if checked else "skipped")
     out["ok"] = sc and not mismatch

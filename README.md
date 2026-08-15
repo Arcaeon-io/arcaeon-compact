@@ -75,18 +75,22 @@ ledger head externally, exactly as `arcaeon-ledger`'s docs describe.
 
 ```json
 {
-  "schema": "arcaeon-compact:receipt:v1",
+  "schema": "arcaeon-compact:receipt:v2",
   "pre":     {"count": 4, "bytes": 121, "digest": "sha256:json-c14n:v1:0fa1…"},
   "post":    {"count": 2, "bytes": 49,  "digest": "sha256:json-c14n:v1:2623…"},
   "dropped": {"count": 3, "bytes": 84,  "items": ["sha256:raw-bytes:v1:9ecb…", "…"]},
-  "introduced": {"count": 1},
+  "introduced": {"count": 1, "bytes": 12},
   "compactor": "summarizer-v2",
   "method": "llm-summary",
   "opened_at": "2026-08-14T17:40:00Z",
-  "receipt_digest": "sha256:json-c14n:v1:9a0f…",
+  "receipt_digest": "sha256:json-c14n:v1:04f2…",
   "ts": "…", "chain": "…"
 }
 ```
+
+(A receipt sealed before 0.1.2 looks the same minus `introduced.bytes` and
+with `"schema": "arcaeon-compact:receipt:v1"` — still valid, still verifiable,
+see "Verification, honestly scoped" below for what changes.)
 
 - Every digest is **self-describing** (`sha256:<recipe>:<ver>:<hex>`), carrying
   its own pinned canonicalization recipe from `arcaeon-ledger` — never a bare
@@ -95,10 +99,10 @@ ledger head externally, exactly as `arcaeon-ledger`'s docs describe.
   through the pinned `json-c14n` recipe.
 - The **whole-content digests** are a digest over the ordered per-item digests,
   so they recompute from content alone — content is never stored.
-- **`introduced`** counts survivor items that were never in the pre-content:
-  the summary text itself, typically. It closes the arithmetic
-  (`pre = kept + dropped`, `post = kept + introduced`) so the counts can't be
-  fudged independently.
+- **`introduced`** counts (and, as of v2, sizes in bytes) survivor items that
+  were never in the pre-content: the summary text itself, typically. It
+  closes the arithmetic (`pre = kept + dropped`, `post = kept + introduced`)
+  so the counts — and, in v2, the bytes — can't be fudged independently.
 - **`receipt_digest`** covers the deterministic core, so an edited row is
   caught even when it's been copied *out* of its ledger. Inside the ledger,
   the chain catches the same edit; this check travels with the row.
@@ -119,12 +123,51 @@ Self-consistency (no content needed) checks the schema, every digest's shape,
 the count arithmetic, the **byte** arithmetic, and the `receipt_digest`. The
 byte check matters more than it looks: after a compaction the dropped content
 is gone, so this is the only check anyone can still run, and "how much did you
-cut" is the number they read. A receipt that claims it dropped 1 byte out of
-500 — or a billion out of 600 — is arithmetically impossible and now says so
-without needing the content back. With content provided, every
-digest is recomputed and compared — and with **both** sides provided, the drop
+cut" is the number they read.
+
+**As of schema v2 (0.1.2, 2026-08-15 — HIGH-1 fix), the byte check is exact,
+unconditionally.** `seal()` now records `introduced.bytes` alongside
+`introduced.count` — computed for real from the actual post-content given to
+`record_kept()`, not a number a caller can hand-wave — so `verify_receipt`
+asserts `post.bytes == pre.bytes - dropped.bytes + introduced.bytes` exactly,
+whether or not anything was introduced. **Overstatement** was always caught
+(a receipt claiming it dropped a billion bytes out of 600 is arithmetically
+impossible and says so); **understatement is now caught too**, even behind a
+claimed introduction — the exact scenario every real summarizer hits, and the
+one v1 missed:
+
+```python
+verify_receipt(row)
+# {"ok": bool, "self_consistent": bool, "content": "skipped" | "match" | "mismatch",
+#  "schema": "v1" | "v2", "understatement_check": "truncation-only" | "full",
+#  "notes": [...]}
+```
+
+**Reading old (v1) receipts still works, and says so.** A receipt sealed
+before 0.1.2 never recorded `introduced.bytes`; `verify_receipt` still
+verifies it — schema unchanged, digests unchanged, nothing stranded — but
+reports `schema: "v1"` and `understatement_check: "truncation-only"`: for a
+v1 row, `post.bytes` is pinned exactly only when `introduced.count == 0`
+(pure truncation, "dropped 1 byte out of 500" refused); the moment a v1 row
+claims an introduction, `post.bytes` is only lower-bounded, so a lying
+compactor could understate `dropped.bytes` behind a claimed summary and pass
+v1 self-consistency with no content held. That was the v1 gap this release
+closes going forward — old rows are read honestly under the rule they were
+actually sealed with, not silently upgraded to a guarantee they never made.
+
+Content-free self-consistency, v1 or v2, can never fully *prove* any claim —
+every field in the row is self-reported, and a determined forger who controls
+every number can pick a combination that satisfies whatever equation is being
+checked. What v2 changes is how much freedom that leaves: v1's inequality let
+`post.bytes` float across an entire attacker-controlled range once
+`introduced.count > 0`; v2's equality pins it to one value, so a single
+tampered field (say, just `dropped.bytes`) now breaks the check immediately
+instead of needing a second compensating edit (`post.bytes` inflated to
+match) to slip through. With content provided, every digest is recomputed and
+compared regardless of schema — and with **both** sides provided, the drop
 set itself is recomputed (pre minus post, by digest) and held against the
-manifest. That last comparison is the point of the whole library:
+manifest, same as always. That last comparison is the point of the whole
+library:
 
 ```python
 # the compactor claims nothing was dropped...
@@ -174,9 +217,10 @@ receipts file is just a ledger file; the receipt is just a row with a schema.
 
 ## Status
 
-v0.1.0. Library + packaged self-test, tested against the planted-drop lie,
-in-row edits, multiset duplicates, byte totals, and lifecycle misuse
-(`test_compact.py`). Extracted from the context-compaction flow of a
+v0.1.2. Library + packaged self-test, tested against the planted-drop lie,
+in-row edits, multiset duplicates, byte totals, schema v1/v2 compatibility,
+the understated-dropped-bytes-behind-an-introduction attack, and lifecycle
+misuse (`test_compact.py`). Extracted from the context-compaction flow of a
 long-running agent that wanted receipts for its own memory pruning before
 selling them to anyone else.
 
