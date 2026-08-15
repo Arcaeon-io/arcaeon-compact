@@ -19,6 +19,16 @@ pip install arcaeon-compact     # brings arcaeon-ledger; nothing else
 ```python
 from arcaeon_compact import CompactionReceipt, verify_receipt
 
+conversation_turns = [                     # a real one is longer; four turns shows the shape
+    "user: what's the refund window?",
+    "assistant: 30 days from delivery.",
+    "user: does that cover digital goods?",
+    "assistant: yes, minus any credits already spent.",
+]
+
+def summarize(turns):                      # stand-in for your compactor
+    return [turns[0], "assistant: 30-day refunds, digital goods included."]
+
 pre  = conversation_turns                  # list of str | bytes | dict
 post = summarize(pre)                      # your compactor, any compactor
 
