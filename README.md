@@ -116,7 +116,12 @@ verify_receipt(row, pre_content=pre, post_content=post)
 ```
 
 Self-consistency (no content needed) checks the schema, every digest's shape,
-the count arithmetic, and the `receipt_digest`. With content provided, every
+the count arithmetic, the **byte** arithmetic, and the `receipt_digest`. The
+byte check matters more than it looks: after a compaction the dropped content
+is gone, so this is the only check anyone can still run, and "how much did you
+cut" is the number they read. A receipt that claims it dropped 1 byte out of
+500 — or a billion out of 600 — is arithmetically impossible and now says so
+without needing the content back. With content provided, every
 digest is recomputed and compared — and with **both** sides provided, the drop
 set itself is recomputed (pre minus post, by digest) and held against the
 manifest. That last comparison is the point of the whole library:

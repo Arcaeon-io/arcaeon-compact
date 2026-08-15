@@ -54,7 +54,7 @@ from typing import Any, Iterable, Sequence
 
 from arcaeon_ledger import Ledger, digest_bytes, digest_json
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __all__ = ["CompactionReceipt", "verify_receipt", "SCHEMA"]
 
 # The receipt schema label, frozen at v1. A future shape change mints v2;
@@ -304,6 +304,35 @@ def verify_receipt(row: dict, pre_content: Sequence[Any] | None = None,
     elif post["count"] - introduced["count"] != kept:
         sc = False
         notes.append("counts do not reconcile: post - introduced != pre - dropped")
+
+    # Byte arithmetic reconciles too, and it has to be checked HERE — after a
+    # compaction the dropped content is gone, so self-consistency is the only
+    # check left, and "how much did you cut" is the number people read. The
+    # invariants, from equal digests implying equal bytes:
+    #   dropped items are a sub-multiset of pre     -> dropped.bytes <= pre.bytes
+    #   post = kept + introduced, introduced >= 0   -> pre.bytes - dropped.bytes <= post.bytes
+    #   nothing introduced                          -> pre.bytes - dropped.bytes == post.bytes
+    #   nothing dropped                             -> dropped.bytes == 0
+    # (dropped.count > 0 with dropped.bytes == 0 is legal: empty items exist.)
+    if dropped["bytes"] > pre["bytes"]:
+        sc = False
+        notes.append(f"dropped.bytes {dropped['bytes']} exceeds pre.bytes "
+                     f"{pre['bytes']} — impossible, drops come out of pre")
+    elif dropped["count"] == 0 and dropped["bytes"] != 0:
+        sc = False
+        notes.append(f"dropped.count is 0 but dropped.bytes is "
+                     f"{dropped['bytes']}")
+    else:
+        kept_bytes = pre["bytes"] - dropped["bytes"]
+        if introduced["count"] == 0 and post["bytes"] != kept_bytes:
+            sc = False
+            notes.append(f"bytes do not reconcile: nothing was introduced, so "
+                         f"post.bytes must equal pre.bytes - dropped.bytes "
+                         f"({kept_bytes}), got {post['bytes']}")
+        elif post["bytes"] < kept_bytes:
+            sc = False
+            notes.append(f"bytes do not reconcile: post.bytes {post['bytes']} "
+                         f"is below the kept bytes it must contain ({kept_bytes})")
     if row.get("receipt_digest") != digest_json(_core_body(row)):
         sc = False
         notes.append("receipt_digest does not reproduce from the row's core "
